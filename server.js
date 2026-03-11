@@ -1,0 +1,2 @@
+postgresql://neondb_owner:npg_LWhHQJ4AOV5E@ep-shiny-glitter-a1445cf3-pooler.ap-southeast-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require
+MySecretKeyForDiagnosticPlatform2024!@#VerySecureKey12345
