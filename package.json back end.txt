@@ -1,0 +1,628 @@
+const express = require('express');
+const cors = require('cors');
+const { Pool } = require('pg');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const { v4: uuidv4 } = require('uuid');
+require('dotenv').config();
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+// Database connection
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
+
+// Test database connection
+pool.query('SELECT NOW()', (err, res) => {
+  if (err) {
+    console.error('Database connection error:', err);
+  } else {
+    console.log('Database connected successfully');
+  }
+});
+
+// Authentication middleware
+const authenticate = async (req, res, next) => {
+  try {
+    const token = req.headers.authorization?.split(' ')[1];
+    if (!token) return res.status(401).json({ message: 'No token provided' });
+    
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    req.user = decoded;
+    next();
+  } catch (error) {
+    res.status(401).json({ message: 'Invalid token' });
+  }
+};
+
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.json({ status: 'OK', timestamp: new Date().toISOString() });
+});
+
+// Login
+app.post('/api/auth/login', async (req, res) => {
+  const { email, password } = req.body;
+  
+  try {
+    const result = await pool.query(
+      'SELECT * FROM users WHERE email = $1 AND is_active = true',
+      [email.toLowerCase()]
+    );
+    
+    if (result.rows.length === 0) {
+      return res.status(401).json({ message: 'Invalid credentials' });
+    }
+    
+    const user = result.rows[0];
+    const isValid = await bcrypt.compare(password, user.password_hash);
+    
+    if (!isValid) {
+      return res.status(401).json({ message: 'Invalid credentials' });
+    }
+    
+    const token = jwt.sign(
+      { userId: user.id, email: user.email, role: user.role, centerId: user.center_id },
+      process.env.JWT_SECRET,
+      { expiresIn: '24h' }
+    );
+    
+    // Get center info if user has center
+    let centerInfo = null;
+    if (user.center_id) {
+      const centerResult = await pool.query(
+        'SELECT name, code, region FROM diagnostic_centers WHERE id = $1',
+        [user.center_id]
+      );
+      if (centerResult.rows.length > 0) {
+        centerInfo = centerResult.rows[0];
+      }
+    }
+    
+    res.json({
+      token,
+      user: {
+        id: user.id,
+        email: user.email,
+        fullName: user.full_name,
+        role: user.role,
+        centerId: user.center_id,
+        centerName: centerInfo?.name,
+        centerCode: centerInfo?.code,
+        region: centerInfo?.region
+      }
+    });
+  } catch (error) {
+    console.error('Login error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Get current user profile
+app.get('/api/auth/profile', authenticate, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT u.id, u.email, u.full_name, u.role, u.center_id, 
+              dc.name as center_name, dc.code as center_code, dc.region
+       FROM users u 
+       LEFT JOIN diagnostic_centers dc ON u.center_id = dc.id 
+       WHERE u.id = $1`,
+      [req.user.userId]
+    );
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+    
+    const user = result.rows[0];
+    res.json({
+      user: {
+        id: user.id,
+        email: user.email,
+        fullName: user.full_name,
+        role: user.role,
+        centerId: user.center_id,
+        centerName: user.center_name,
+        centerCode: user.center_code,
+        region: user.region
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Get all departments
+app.get('/api/departments', authenticate, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT * FROM departments WHERE is_active = true ORDER BY name'
+    );
+    res.json({ departments: result.rows });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Get indicators by department
+app.get('/api/departments/:id/indicators', authenticate, async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    // Get department name first
+    const deptResult = await pool.query(
+      'SELECT name FROM departments WHERE id = $1',
+      [id]
+    );
+    
+    if (deptResult.rows.length === 0) {
+      return res.status(404).json({ message: 'Department not found' });
+    }
+    
+    const deptName = deptResult.rows[0].name;
+    
+    // Get indicators for this department or general ones
+    const result = await pool.query(
+      `SELECT * FROM indicators 
+       WHERE is_active = true 
+       AND (department = $1 OR department IS NULL)
+       ORDER BY display_order, name`,
+      [deptName]
+    );
+    
+    res.json({ indicators: result.rows });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Get all centers (super admin only) or user's center
+app.get('/api/centers', authenticate, async (req, res) => {
+  try {
+    let result;
+    if (req.user.role === 'super_admin') {
+      result = await pool.query(
+        'SELECT * FROM diagnostic_centers WHERE is_active = true ORDER BY name'
+      );
+    } else if (req.user.centerId) {
+      result = await pool.query(
+        'SELECT * FROM diagnostic_centers WHERE id = $1',
+        [req.user.centerId]
+      );
+    } else {
+      return res.status(403).json({ message: 'No center assigned' });
+    }
+    
+    res.json({ centers: result.rows });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Get single center
+app.get('/api/centers/:id', authenticate, async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    // Check permissions
+    if (req.user.role !== 'super_admin' && req.user.centerId !== id) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+    
+    const result = await pool.query(
+      'SELECT * FROM diagnostic_centers WHERE id = $1',
+      [id]
+    );
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: 'Center not found' });
+    }
+    
+    res.json({ center: result.rows[0] });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Create center (super admin only)
+app.post('/api/centers', authenticate, async (req, res) => {
+  if (req.user.role !== 'super_admin') {
+    return res.status(403).json({ message: 'Admin only' });
+  }
+  
+  try {
+    const { name, code, region, city, address, contactPerson, contactPhone, contactEmail } = req.body;
+    
+    const result = await pool.query(
+      `INSERT INTO diagnostic_centers (id, name, code, region, city, address, contact_person, contact_phone, contact_email)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+       RETURNING *`,
+      [uuidv4(), name, code, region, city, address, contactPerson, contactPhone, contactEmail]
+    );
+    
+    res.status(201).json({ center: result.rows[0] });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Save data entry
+app.post('/api/data-entries', authenticate, async (req, res) => {
+  const client = await pool.connect();
+  
+  try {
+    await client.query('BEGIN');
+    
+    const { centerId, departmentId, entryMonth, values, status } = req.body;
+    const userId = req.user.userId;
+    
+    // Check permissions
+    if (req.user.role !== 'super_admin' && req.user.centerId !== centerId) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ message: 'Access denied' });
+    }
+    
+    // Check if entry exists for this center/month/department
+    const existing = await client.query(
+      'SELECT id FROM data_entries WHERE center_id = $1 AND entry_month = $2 AND department_id = $3',
+      [centerId, entryMonth, departmentId || null]
+    );
+    
+    let entryId;
+    
+    if (existing.rows.length > 0) {
+      // Update existing
+      entryId = existing.rows[0].id;
+      await client.query(
+        'UPDATE data_entries SET status = $1, submitted_by = $2, submitted_at = CURRENT_TIMESTAMP WHERE id = $3',
+        [status, userId, entryId]
+      );
+      // Delete old values
+      await client.query('DELETE FROM indicator_values WHERE entry_id = $1', [entryId]);
+    } else {
+      // Create new
+      entryId = uuidv4();
+      await client.query(
+        'INSERT INTO data_entries (id, center_id, department_id, entry_month, submitted_by, status) VALUES ($1, $2, $3, $4, $5, $6)',
+        [entryId, centerId, departmentId || null, entryMonth, userId, status]
+      );
+    }
+    
+    // Insert new values
+    for (const value of values) {
+      if (value.value || value.value === 0) {
+        await client.query(
+          'INSERT INTO indicator_values (id, entry_id, indicator_id, value_numeric, notes) VALUES ($1, $2, $3, $4, $5)',
+          [uuidv4(), entryId, value.indicatorId, value.value, value.notes || null]
+        );
+      }
+    }
+    
+    await client.query('COMMIT');
+    
+    res.json({ 
+      message: status === 'submitted' ? 'Data submitted successfully' : 'Draft saved',
+      entryId 
+    });
+    
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Save error:', error);
+    res.status(500).json({ message: 'Server error' });
+  } finally {
+    client.release();
+  }
+});
+
+// Get center entries
+app.get('/api/data-entries/center/:centerId', authenticate, async (req, res) => {
+  try {
+    const { centerId } = req.params;
+    const { year } = req.query;
+    
+    // Check permissions
+    if (req.user.role !== 'super_admin' && req.user.centerId !== centerId) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+    
+    let sql = `SELECT de.*, d.name as department_name 
+               FROM data_entries de
+               LEFT JOIN departments d ON de.department_id = d.id
+               WHERE de.center_id = $1`;
+    const params = [centerId];
+    
+    if (year) {
+      sql += ` AND EXTRACT(YEAR FROM de.entry_month) = $2`;
+      params.push(year);
+    }
+    
+    sql += ` ORDER BY de.entry_month DESC, d.name`;
+    
+    const result = await pool.query(sql, params);
+    
+    // Group by month
+    const grouped = result.rows.reduce((acc, entry) => {
+      const monthKey = entry.entry_month;
+      if (!acc[monthKey]) {
+        acc[monthKey] = {
+          month: monthKey,
+          departments: []
+        };
+      }
+      acc[monthKey].departments.push(entry);
+      return acc;
+    }, {});
+    
+    res.json({ 
+      entries: result.rows,
+      groupedByMonth: Object.values(grouped)
+    });
+  } catch (error) {
+    console.error('Fetch error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Get single entry
+app.get('/api/data-entries/:id', authenticate, async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    const entryResult = await pool.query(
+      `SELECT de.*, dc.name as center_name, u.full_name as submitted_by_name,
+              d.name as department_name
+       FROM data_entries de
+       JOIN diagnostic_centers dc ON de.center_id = dc.id
+       JOIN users u ON de.submitted_by = u.id
+       LEFT JOIN departments d ON de.department_id = d.id
+       WHERE de.id = $1`,
+      [id]
+    );
+    
+    if (entryResult.rows.length === 0) {
+      return res.status(404).json({ message: 'Entry not found' });
+    }
+    
+    const entry = entryResult.rows[0];
+    
+    // Check permissions
+    if (req.user.role !== 'super_admin' && req.user.centerId !== entry.center_id) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+    
+    // Get values
+    const valuesResult = await pool.query(
+      `SELECT iv.*, i.name as indicator_name, i.code as indicator_code, i.unit
+       FROM indicator_values iv
+       JOIN indicators i ON iv.indicator_id = i.id
+       WHERE iv.entry_id = $1`,
+      [id]
+    );
+    
+    res.json({ entry, values: valuesResult.rows });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Review entry (approve/reject) - super admin only
+app.put('/api/data-entries/:id/review', authenticate, async (req, res) => {
+  if (req.user.role !== 'super_admin') {
+    return res.status(403).json({ message: 'Admin only' });
+  }
+  
+  try {
+    const { id } = req.params;
+    const { status, notes } = req.body;
+    
+    if (!['approved', 'rejected'].includes(status)) {
+      return res.status(400).json({ message: 'Invalid status' });
+    }
+    
+    const result = await pool.query(
+      `UPDATE data_entries 
+       SET status = $1, reviewed_by = $2, reviewed_at = CURRENT_TIMESTAMP, review_notes = $3
+       WHERE id = $4
+       RETURNING *`,
+      [status, req.user.userId, notes, id]
+    );
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: 'Entry not found' });
+    }
+    
+    res.json({ message: `Entry ${status}`, entry: result.rows[0] });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Get pending entries (super admin)
+app.get('/api/data-entries/pending', authenticate, async (req, res) => {
+  if (req.user.role !== 'super_admin') {
+    return res.status(403).json({ message: 'Admin only' });
+  }
+  
+  try {
+    const result = await pool.query(
+      `SELECT de.*, dc.name as center_name, dc.region, u.full_name as submitted_by_name,
+              d.name as department_name
+       FROM data_entries de
+       JOIN diagnostic_centers dc ON de.center_id = dc.id
+       JOIN users u ON de.submitted_by = u.id
+       LEFT JOIN departments d ON de.department_id = d.id
+       WHERE de.status = 'submitted'
+       ORDER BY de.submitted_at DESC
+       LIMIT 20`
+    );
+    
+    res.json({ entries: result.rows });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Dashboard analytics
+app.get('/api/analytics/dashboard', authenticate, async (req, res) => {
+  try {
+    const year = req.query.year || new Date().getFullYear();
+    
+    // Overall stats
+    const statsResult = await pool.query(
+      `SELECT 
+         COUNT(DISTINCT dc.id) as total_centers,
+         COUNT(DISTINCT CASE WHEN dc.is_active THEN dc.id END) as active_centers,
+         COUNT(DISTINCT de.id) as total_entries,
+         COUNT(DISTINCT CASE WHEN de.status = 'submitted' THEN de.id END) as pending_review,
+         COUNT(DISTINCT CASE WHEN de.status = 'approved' THEN de.id END) as approved_entries
+       FROM diagnostic_centers dc
+       LEFT JOIN data_entries de ON dc.id = de.center_id`
+    );
+    
+    // Monthly trend
+    const trendResult = await pool.query(
+      `SELECT 
+         TO_CHAR(entry_month, 'YYYY-MM') as month,
+         COUNT(*) as entry_count,
+         COUNT(CASE WHEN status = 'approved' THEN 1 END) as approved_count
+       FROM data_entries
+       WHERE EXTRACT(YEAR FROM entry_month) = $1
+       GROUP BY TO_CHAR(entry_month, 'YYYY-MM')
+       ORDER BY month`,
+      [year]
+    );
+    
+    // Top centers
+    const topCentersResult = await pool.query(
+      `SELECT 
+         dc.id, dc.name, dc.region,
+         COUNT(de.id) as entry_count,
+         MAX(de.entry_month) as last_submission
+       FROM diagnostic_centers dc
+       LEFT JOIN data_entries de ON dc.id = de.center_id AND EXTRACT(YEAR FROM de.entry_month) = $1
+       WHERE dc.is_active = true
+       GROUP BY dc.id, dc.name, dc.region
+       ORDER BY entry_count DESC
+       LIMIT 10`,
+      [year]
+    );
+    
+    res.json({
+      stats: statsResult.rows[0],
+      monthlyTrend: trendResult.rows,
+      topCenters: topCentersResult.rows
+    });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Get quality metrics
+app.get('/api/analytics/quality-metrics', authenticate, async (req, res) => {
+  try {
+    const { year = new Date().getFullYear(), month } = req.query;
+    
+    let dateFilter = `EXTRACT(YEAR FROM ms.entry_month) = ${year}`;
+    if (month) {
+      dateFilter += ` AND EXTRACT(MONTH FROM ms.entry_month) = ${month}`;
+    }
+    
+    const result = await pool.query(
+      `SELECT 
+         dc.region,
+         SUM(ms.total_specimens) as total_specimens,
+         SUM(ms.total_qc) as total_qc,
+         SUM(ms.failed_qc) as failed_qc,
+         AVG(ms.qc_acceptance_rate) as avg_qc_acceptance,
+         SUM(ms.rejected_samples) as rejected_samples,
+         SUM(ms.total_panic) as total_panic,
+         SUM(ms.informed_panic) as informed_panic,
+         SUM(ms.uninformed_panic) as uninformed_panic
+       FROM diagnostic_centers dc
+       LEFT JOIN monthly_summary ms ON dc.id = ms.center_id AND ${dateFilter}
+       WHERE dc.is_active = true
+       GROUP BY dc.region
+       ORDER BY dc.region`
+    );
+    
+    // Calculate national stats
+    const nationalStats = result.rows.reduce((acc, row) => ({
+      totalSpecimens: acc.totalSpecimens + (parseInt(row.total_specimens) || 0),
+      totalQc: acc.totalQc + (parseInt(row.total_qc) || 0),
+      failedQc: acc.failedQc + (parseInt(row.failed_qc) || 0),
+      rejectedSamples: acc.rejectedSamples + (parseInt(row.rejected_samples) || 0),
+      totalPanic: acc.totalPanic + (parseInt(row.total_panic) || 0),
+      uninformedPanic: acc.uninformedPanic + (parseInt(row.uninformed_panic) || 0)
+    }), { totalSpecimens: 0, totalQc: 0, failedQc: 0, rejectedSamples: 0, totalPanic: 0, uninformedPanic: 0 });
+    
+    nationalStats.qcAcceptanceRate = nationalStats.totalQc > 0
+      ? (((nationalStats.totalQc - nationalStats.failedQc) / nationalStats.totalQc) * 100).toFixed(2)
+      : 0;
+    
+    nationalStats.panicNotificationRate = nationalStats.totalPanic > 0
+      ? (((nationalStats.totalPanic - nationalStats.uninformedPanic) / nationalStats.totalPanic) * 100).toFixed(2)
+      : 0;
+    
+    res.json({
+      regionalData: result.rows,
+      nationalStats
+    });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Export data
+app.get('/api/analytics/export', authenticate, async (req, res) => {
+  if (req.user.role !== 'super_admin') {
+    return res.status(403).json({ message: 'Admin only' });
+  }
+  
+  try {
+    const { startDate, endDate, centerId, region } = req.query;
+    
+    let sql = `SELECT * FROM monthly_summary WHERE 1=1`;
+    const params = [];
+    
+    if (startDate) {
+      params.push(startDate);
+      sql += ` AND entry_month >= $${params.length}`;
+    }
+    
+    if (endDate) {
+      params.push(endDate);
+      sql += ` AND entry_month <= $${params.length}`;
+    }
+    
+    if (centerId) {
+      params.push(centerId);
+      sql += ` AND center_id = $${params.length}`;
+    }
+    
+    if (region) {
+      params.push(region);
+      sql += ` AND region = $${params.length}`;
+    }
+    
+    sql += ' ORDER BY entry_month DESC, center_name';
+    
+    const result = await pool.query(sql, params);
+    
+    res.json({
+      data: result.rows,
+      count: result.rows.length,
+      generatedAt: new Date().toISOString()
+    });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
